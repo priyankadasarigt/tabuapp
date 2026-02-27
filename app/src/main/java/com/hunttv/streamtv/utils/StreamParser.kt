@@ -6,24 +6,18 @@ import org.json.JSONObject
 /**
  * Parses pipe-encoded stream URLs.
  *
- * Format:  url|Key=value&Key=value&drmScheme=clearkey&drmLicense=<url-or-keys>
+ * Format: url|User-Agent=x&Cookie=y&drmScheme=clearkey&drmLicense=<value>
  *
- * BUG FIX: drmLicense values that are HTTP URLs may themselves contain '&'
+ * FIX: drmLicense values that are HTTP URLs may contain '&'
  * (e.g. https://license.example.com/key?token=abc&session=xyz).
- * Old code split on ALL '&' which corrupted those URLs.
- * Fix: parse known short keys first, then treat everything remaining as drmLicense.
+ * Old code split ALL params on '&' which corrupted those URLs.
+ * Fix: two-pass — parse known short keys first, then treat everything
+ * after drmLicense= as the license value (captures & in URLs).
  */
 object StreamParser {
 
-    // Keys whose values are short and will never contain '&'
-    private val SIMPLE_KEYS = setOf(
-        "cookie", "referer", "origin", "user-agent", "useragent",
-        "accept", "accept-language", "authorization", "drmscheme", "exthttpjson"
-    )
-
     fun parseStreamUrl(fullUrl: String): ParsedStreamData {
 
-        // Decode common percent-encoded chars (but NOT & = which are delimiters)
         val decodedUrl = fullUrl
             .replace("%7C", "|").replace("%7c", "|")
             .replace("%3F", "?").replace("%3f", "?")
@@ -58,12 +52,8 @@ object StreamParser {
         var extHttpJson = ""
 
         if (paramsString.isNotEmpty()) {
-            // ── Two-pass parse ────────────────────────────────────────────────
-            // Pass 1: collect all segments split by '&'
-            // Pass 2: anything whose key is "drmlicense" gets the REST of the
-            //         params string from that '&' onwards, not just up to the next '&'.
-            //         This correctly handles license URLs that contain '&'.
-
+            // Two-pass: find where drmLicense= starts, split there.
+            // Everything after drmLicense= is the license value (may contain &).
             val drmLicenseIdx = findDrmLicenseIndex(paramsString)
 
             val simplePart: String
@@ -71,29 +61,27 @@ object StreamParser {
 
             if (drmLicenseIdx >= 0) {
                 simplePart  = paramsString.substring(0, drmLicenseIdx)
-                // value starts after "drmLicense=" (11 chars)
-                val afterKey = paramsString.indexOf("=", drmLicenseIdx)
-                licensePart  = if (afterKey >= 0) paramsString.substring(afterKey + 1) else ""
+                val afterEq = paramsString.indexOf("=", drmLicenseIdx)
+                licensePart = if (afterEq >= 0) paramsString.substring(afterEq + 1) else ""
             } else {
                 simplePart  = paramsString
                 licensePart = ""
             }
 
-            // Parse simple key=value pairs
             simplePart.split("&").forEach { param ->
                 val eqIdx = param.indexOf("="); if (eqIdx < 0) return@forEach
                 val key   = param.substring(0, eqIdx).trim()
                 val value = param.substring(eqIdx + 1).trim()
                 when (key.lowercase()) {
-                    "cookie"                   -> headers["Cookie"]          = value
-                    "referer"                  -> headers["Referer"]         = value
-                    "origin"                   -> headers["Origin"]          = value
-                    "user-agent", "useragent"  -> headers["User-Agent"]      = value
-                    "accept"                   -> headers["Accept"]          = value
-                    "accept-language"          -> headers["Accept-Language"] = value
-                    "authorization"            -> headers["Authorization"]   = value
-                    "drmscheme"                -> drmScheme  = value
-                    "exthttpjson"              -> extHttpJson = value
+                    "cookie"                  -> headers["Cookie"]          = value
+                    "referer"                 -> headers["Referer"]         = value
+                    "origin"                  -> headers["Origin"]          = value
+                    "user-agent", "useragent" -> headers["User-Agent"]      = value
+                    "accept"                  -> headers["Accept"]          = value
+                    "accept-language"         -> headers["Accept-Language"] = value
+                    "authorization"           -> headers["Authorization"]   = value
+                    "drmscheme"               -> drmScheme  = value
+                    "exthttpjson"             -> extHttpJson = value
                     else -> if (key.isNotEmpty() && value.isNotEmpty()) headers[key] = value
                 }
             }
@@ -101,7 +89,7 @@ object StreamParser {
             if (licensePart.isNotEmpty()) drmLicense = licensePart
         }
 
-        // Merge extHttpJson into headers map
+        // Merge extHttpJson headers into request headers
         if (extHttpJson.isNotEmpty()) {
             try {
                 val json = JSONObject(extHttpJson); val keys = json.keys()
@@ -129,13 +117,8 @@ object StreamParser {
         )
     }
 
-    /**
-     * Returns the index in [paramsString] where "drmLicense=" starts (case-insensitive),
-     * or -1 if not present.
-     */
     private fun findDrmLicenseIndex(paramsString: String): Int {
         val lower = paramsString.lowercase()
-        // Must be at start OR immediately after '&'
         var idx = lower.indexOf("drmlicense=")
         while (idx >= 0) {
             if (idx == 0 || paramsString[idx - 1] == '&') return idx
