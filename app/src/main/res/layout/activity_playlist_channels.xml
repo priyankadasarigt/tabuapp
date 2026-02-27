@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="@drawable/gradient_background">
+
+    <!-- Glass Top Bar -->
+    <androidx.cardview.widget.CardView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_margin="12dp"
+        app:cardCornerRadius="18dp"
+        app:cardElevation="0dp"
+        app:cardBackgroundColor="#33FFFFFF">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="60dp"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:paddingHorizontal="8dp">
+
+            <!-- Back -->
+            <ImageButton
+                android:id="@+id/btn_back"
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:src="@drawable/ic_arrow_back"
+                android:background="?android:attr/selectableItemBackgroundBorderless"
+                android:tint="#FFFFFFFF" />
+
+            <!-- Title -->
+            <TextView
+                android:id="@+id/tv_title"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Channels"
+                android:textSize="18sp"
+                android:textStyle="bold"
+                android:textColor="#FFFFFFFF"
+                android:layout_marginStart="4dp"
+                android:maxLines="1"
+                android:ellipsize="end" />
+
+            <!-- Refresh -->
+            <ImageButton
+                android:id="@+id/btn_refresh"
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:src="@drawable/ic_refresh"
+                android:background="?android:attr/selectableItemBackgroundBorderless"
+                android:tint="#FFFFFFFF" />
+
+            <!-- Favorites -->
+            <ImageButton
+                android:id="@+id/btn_favorites"
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:src="@android:drawable/btn_star_big_off"
+                android:background="?android:attr/selectableItemBackgroundBorderless" />
+
+            <!-- Search -->
+            <SearchView
+                android:id="@+id/search_view"
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:iconifiedByDefault="true"
+                android:queryHint="Search..."
+                android:theme="@style/SearchViewTheme" />
+
+        </LinearLayout>
+    </androidx.cardview.widget.CardView>
+
+    <!-- Loading -->
+    <ProgressBar
+        android:id="@+id/progress_bar"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:layout_marginTop="100dp"
+        android:visibility="gone" />
+
+    <!-- Error -->
+    <TextView
+        android:id="@+id/tv_error"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textSize="15sp"
+        android:textColor="#CCFFFFFF"
+        android:gravity="center"
+        android:layout_marginTop="100dp"
+        android:padding="24dp"
+        android:visibility="gone" />
+
+    <!-- Channel Grid -->
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/recycler_channels"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:clipToPadding="false"
+        android:paddingHorizontal="8dp"
+        android:paddingBottom="16dp" />
+
+</LinearLayout>
