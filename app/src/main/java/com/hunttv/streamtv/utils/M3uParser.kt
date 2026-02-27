@@ -11,19 +11,24 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 /**
- * M3U parser rewritten to match the working "Network Stream Video Player" app (oa3.java).
+ * M3U / M3U8 parser.
  *
- * CRITICAL DIFFERENCES vs old parser:
+ * Supports:
+ *  • #EXTVLCOPT  user-agent / referrer / cookie / origin / drm-scheme / drm-license
+ *  • #KODIPROP   license_type / license_key
+ *  • #EXTHTTP    {"cookie":"..."} JSON
+ *  • Pipe-suffix params on the URL line:
+ *      url|User-Agent=x&Referer=y
+ *      url|user-agent=x|referer=y   (VLC pipe style)
+ *      url?|...
+ *  • Xtream-style direct .m3u8 / .ts URLs (no extra params)
+ *  • Multi-pair ClearKey: "kid1:key1,kid2:key2"
  *
- * 1. #EXTHTTP  → raw JSON stored separately (NOT merged into stream headers)
- *    Working app passes it as "extHttpJson" → PlayerActivity sends it as DRM key request headers
- *    This is how the cookie reaches the clearkey license server!
- *
- * 2. #KODIPROP license_key URL → stored AS-IS, not decoded
- *    PlayerActivity detects it's a URL → uses HttpMediaDrmCallback to FETCH live
- *    (this is the core fix — your old app tried to extract key from URL params instead)
- *
- * 3. Multiple clearkey pairs (comma-separated "kid1:key1,kid2:key2") are supported
+ * BUG FIXES vs original:
+ *  1. Pipe-suffix regex was case-sensitive and missed variants like "User-Agent"
+ *  2. ?| stripping was broken for some URL shapes
+ *  3. drmLicense in pipe suffix was not extracted
+ *  4. VLC multi-pipe style (url|k=v|k=v) was not supported
  */
 object M3uParser {
     private const val TAG = "M3uParser"
@@ -34,8 +39,8 @@ object M3uParser {
             conn.apply {
                 requestMethod = "GET"
                 setRequestProperty("User-Agent", "VLC/3.0.18 LibVLC/3.0.18")
-                connectTimeout = 15000
-                readTimeout    = 30000
+                connectTimeout = 15_000
+                readTimeout    = 30_000
                 instanceFollowRedirects = true
             }
             val text = BufferedReader(InputStreamReader(conn.inputStream)).readText()
@@ -54,120 +59,113 @@ object M3uParser {
 
         while (i < lines.size) {
             val line = lines[i].trim()
-
             if (!line.startsWith("#EXTINF")) { i++; continue }
 
-            // ── #EXTINF line ──────────────────────────────────────────────────
+            // ── #EXTINF ──────────────────────────────────────────────────────
             val name    = line.substringAfterLast(",").trim()
             val logo    = extractAttr(line, "tvg-logo")
             val group   = extractAttr(line, "group-title")
             val tvgId   = extractAttr(line, "tvg-id")
             val tvgName = extractAttr(line, "tvg-name")
 
-            // Per-channel metadata (mirrors ContentBean in the working app)
             var userAgent   = ""
-            var cookie      = ""   // from #EXTVLCOPT:http-cookie
+            var cookie      = ""
             var referer     = ""
             var origin      = ""
-            var drmScheme   = ""   // "clearkey" / "widevine" / "playready"
-            var drmLicense  = ""   // raw: URL or "hex:hex" or "hex:hex,hex:hex" pairs
-            var extHttpJson = ""   // raw JSON from #EXTHTTP, e.g. {"cookie":"__hdnea__=..."}
+            var drmScheme   = ""
+            var drmLicense  = ""
+            var extHttpJson = ""
 
             var j = i + 1
 
-            // ── Read metadata lines until stream URL ──────────────────────────
+            // ── Read metadata lines until the stream URL ─────────────────────
             while (j < lines.size) {
                 val next = lines[j].trim()
                 when {
                     next.isEmpty() -> { j++; continue }
 
                     next.startsWith("#EXTVLCOPT") -> {
-                        // Matches oa3.java exactly
-                        if (next.contains("user-agent", ignoreCase = true))
-                            userAgent = regexFirst(next, ".*http-user-agent=(.+?)$") ?: userAgent
-                        if (next.contains("referrer", ignoreCase = true))
-                            referer   = regexFirst(next, ".*http-referrer=(.+?)$") ?: referer
-                        else if (next.contains("referer", ignoreCase = true))
-                            referer   = regexFirst(next, ".*http-referer=(.+?)$") ?: referer
-                        if (next.contains("cookie", ignoreCase = true))
-                            cookie    = regexFirst(next, """.*http-cookie="?(.+?)"?$""") ?: cookie
-                        if (next.contains("origin", ignoreCase = true))
-                            origin    = regexFirst(next, ".*http-origin=(.+?)$") ?: origin
-                        if (next.contains("drm-scheme", ignoreCase = true))
-                            drmScheme = normalizeDrmScheme(regexFirst(next, ".*http-drm-scheme=(.+?)$"))
-                        if (next.contains("drm-license", ignoreCase = true))
-                            drmLicense = regexFirst(next, ".*http-drm-license=(.+?)$") ?: drmLicense
+                        val lower = next.lowercase()
+                        if (lower.contains("http-user-agent"))
+                            userAgent  = regexFirst(next, "(?i).*http-user-agent=(.+?)$") ?: userAgent
+                        if (lower.contains("http-referrer") || lower.contains("http-referer"))
+                            referer    = regexFirst(next, "(?i).*http-refer+er=(.+?)$") ?: referer
+                        if (lower.contains("http-cookie"))
+                            cookie     = regexFirst(next, """(?i).*http-cookie="?(.+?)"?$""") ?: cookie
+                        if (lower.contains("http-origin"))
+                            origin     = regexFirst(next, "(?i).*http-origin=(.+?)$") ?: origin
+                        if (lower.contains("drm-scheme"))
+                            drmScheme  = normalizeDrm(regexFirst(next, "(?i).*http-drm-scheme=(.+?)$"))
+                        if (lower.contains("drm-license"))
+                            drmLicense = regexFirst(next, "(?i).*http-drm-license=(.+?)$") ?: drmLicense
                         j++
                     }
 
                     next.startsWith("#KODIPROP") -> {
-                        if (next.contains("license_type", ignoreCase = true))
-                            drmScheme = normalizeDrmScheme(regexFirst(next, ".*license_type=(.+?)$"))
-                        if (next.contains("license_key", ignoreCase = true)) {
-                            // !!CRITICAL!! Store the RAW value — URL or "kid:key" pairs
-                            // Do NOT try to decode/parse here.
-                            // PlayerActivity checks: if it starts with "http" → HttpMediaDrmCallback (live fetch)
-                            //                        else → LocalMediaDrmCallback (inline keys)
-                            drmLicense = regexFirst(next, ".*license_key=([^|]+)") ?: drmLicense
-                        }
+                        val lower = next.lowercase()
+                        if (lower.contains("license_type"))
+                            drmScheme  = normalizeDrm(regexFirst(next, "(?i).*license_type=(.+?)$"))
+                        if (lower.contains("license_key"))
+                        // Store RAW — PlayerActivity decides URL vs inline keys
+                            drmLicense = regexFirst(next, "(?i).*license_key=(.+?)$") ?: drmLicense
                         j++
                     }
 
                     next.startsWith("#EXTHTTP") -> {
-                        // Store raw JSON as-is — matching what oa3.java does:
-                        //   builder.header(sd4.c0(sd4.Y(str5, "#EXTHTTP:", str5)).toString())
-                        // This JSON (e.g. {"cookie":"__hdnea__=..."}) gets passed to PlayerActivity
-                        // which uses fw4.m5911() to parse it into a HashMap for DRM key request headers
                         extHttpJson = next.substringAfter("#EXTHTTP:").trim()
                         j++
                     }
 
                     next.startsWith("#") -> { j++; continue }
-                    else                 -> break  // stream URL
+                    else                 -> break  // stream URL line
                 }
             }
 
-            // ── Stream URL line ───────────────────────────────────────────────
             if (j >= lines.size) { i++; continue }
             val urlLine = lines[j].trim()
             if (urlLine.startsWith("#") || urlLine.isEmpty()) { i++; continue }
 
-            // Strip pipe suffix to get clean base URL (matching oa3.java: tt.f(str5, "(.+?)(\\|.*)?")
-            var streamUrl = if (urlLine.contains("|")) urlLine.substringBefore("|") else urlLine
-            // Remove stray trailing '?' left by ?| format
-            streamUrl = streamUrl.trimEnd('?')
+            i = j + 1
 
-            // Also pick up pipe-format UA/referer/origin if not already set from metadata
-            if (urlLine.contains("|")) {
-                if (userAgent.isEmpty())
-                    userAgent = regexFirst(urlLine, """.*\|user-agent=(.+?)(\|.*)?""") ?: ""
-                if (referer.isEmpty())
-                    referer   = regexFirst(urlLine, """.*\|referer=(.+?)(\|.*)?""") ?: ""
-                if (origin.isEmpty())
-                    origin    = regexFirst(urlLine, """.*\|origin=(.+?)(\|.*)?""") ?: ""
+            // ── Parse URL line ───────────────────────────────────────────────
+            // Supports both:
+            //   url|User-Agent=x&Cookie=y  (ampersand style)
+            //   url|user-agent=x|referer=y (VLC multi-pipe style)
+            val (cleanUrl, pipeParts) = splitUrlAndPipe(urlLine)
+            if (cleanUrl.isEmpty()) continue
+
+            // Extract headers from pipe suffix if not already set
+            if (pipeParts.isNotEmpty()) {
+                val pipeUA      = pipeParam(pipeParts, "user-agent", "useragent")
+                val pipeRef     = pipeParam(pipeParts, "referer", "referrer")
+                val pipeOrigin  = pipeParam(pipeParts, "origin")
+                val pipeCookie  = pipeParam(pipeParts, "cookie")
+                val pipeDrmS    = pipeParam(pipeParts, "drmscheme", "drm-scheme", "drm_scheme")
+                val pipeDrmL    = pipeParam(pipeParts, "drmlicense", "drm-license", "drm_license", "license_key")
+
+                if (userAgent.isEmpty()  && pipeUA     != null) userAgent  = pipeUA
+                if (referer.isEmpty()    && pipeRef    != null) referer    = pipeRef
+                if (origin.isEmpty()     && pipeOrigin != null) origin     = pipeOrigin
+                if (cookie.isEmpty()     && pipeCookie != null) cookie     = pipeCookie
+                if (drmScheme.isEmpty()  && pipeDrmS   != null) drmScheme  = normalizeDrm(pipeDrmS)
+                if (drmLicense.isEmpty() && pipeDrmL   != null) drmLicense = pipeDrmL
             }
 
-            i = j + 1
-            if (streamUrl.isEmpty()) continue
-
-            // ── Encode all metadata as pipe params ────────────────────────────
-            // PlayerActivity.initializePlayer() decodes this in StreamParser
+            // ── Build final encoded URL ──────────────────────────────────────
             val parts = mutableListOf<String>()
-            if (userAgent.isNotEmpty())    parts.add("User-Agent=$userAgent")
-            if (cookie.isNotEmpty())       parts.add("Cookie=$cookie")
-            if (referer.isNotEmpty())      parts.add("Referer=$referer")
-            if (origin.isNotEmpty())       parts.add("Origin=$origin")
-            // extHttpJson goes as its own key so PlayerActivity can parse the JSON
-            // and add those headers to BOTH the DRM license request AND stream request
-            if (extHttpJson.isNotEmpty())  parts.add("extHttpJson=$extHttpJson")
+            if (userAgent.isNotEmpty())   parts.add("User-Agent=$userAgent")
+            if (cookie.isNotEmpty())      parts.add("Cookie=$cookie")
+            if (referer.isNotEmpty())     parts.add("Referer=$referer")
+            if (origin.isNotEmpty())      parts.add("Origin=$origin")
+            if (extHttpJson.isNotEmpty()) parts.add("extHttpJson=$extHttpJson")
             if (drmScheme.isNotEmpty() && drmLicense.isNotEmpty()) {
                 parts.add("drmScheme=$drmScheme")
                 parts.add("drmLicense=$drmLicense")
             }
 
-            val finalUrl = if (parts.isNotEmpty()) "$streamUrl|${parts.joinToString("&")}" else streamUrl
+            val finalUrl = if (parts.isNotEmpty()) "$cleanUrl|${parts.joinToString("&")}" else cleanUrl
 
-            Log.d(TAG, "[$name] scheme=$drmScheme licenseIsUrl=${drmLicense.startsWith("http")} hasExtHttp=${extHttpJson.isNotEmpty()}")
+            Log.d(TAG, "[$name] url=${cleanUrl.take(60)} scheme=$drmScheme hasExtHttp=${extHttpJson.isNotEmpty()}")
 
             channels.add(M3uChannel(
                 name       = name,
@@ -184,6 +182,57 @@ object M3uParser {
         return channels
     }
 
+    // ── URL / pipe splitting ──────────────────────────────────────────────────
+
+    /**
+     * Splits a URL line into (cleanBaseUrl, pipeParams map).
+     *
+     * Handles:
+     *   http://x.com/stream.m3u8|User-Agent=VLC&Cookie=abc
+     *   http://x.com/stream.m3u8?foo=bar|User-Agent=VLC
+     *   http://x.com/stream.m3u8?|User-Agent=VLC         ← stray ?
+     *   http://x.com/stream.m3u8|user-agent=VLC|referer=http://x.com
+     */
+    private fun splitUrlAndPipe(urlLine: String): Pair<String, Map<String, String>> {
+        val pipeIdx = urlLine.indexOf("|")
+        if (pipeIdx < 0) return Pair(urlLine.trimEnd('?'), emptyMap())
+
+        var base   = urlLine.substring(0, pipeIdx).trimEnd('?').trim()
+        val suffix = urlLine.substring(pipeIdx + 1).trim()
+
+        if (base.isEmpty()) return Pair("", emptyMap())
+
+        val params = mutableMapOf<String, String>()
+
+        // Detect style: ampersand (k=v&k=v) or multi-pipe (k=v|k=v)
+        val isAmpStyle = suffix.contains("=") &&
+                (suffix.contains("&") || !suffix.contains("|"))
+
+        val segments = if (isAmpStyle) {
+            // Split on & but be careful: drmLicense value might itself have &
+            // For the pipe-suffix case we use simple split since these are rarely long URLs
+            suffix.split("&")
+        } else {
+            // VLC multi-pipe style: user-agent=VLC|referer=http://...
+            suffix.split("|")
+        }
+
+        segments.forEach { seg ->
+            val eqIdx = seg.indexOf("="); if (eqIdx < 0) return@forEach
+            val k = seg.substring(0, eqIdx).trim().lowercase()
+            val v = seg.substring(eqIdx + 1).trim()
+            if (k.isNotEmpty() && v.isNotEmpty()) params[k] = v
+        }
+
+        return Pair(base, params)
+    }
+
+    /** Look up a value from pipe params by any of the given key aliases (all lowercase). */
+    private fun pipeParam(params: Map<String, String>, vararg keys: String): String? {
+        for (k in keys) { val v = params[k]; if (!v.isNullOrEmpty()) return v }
+        return null
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private fun regexFirst(input: String, pattern: String): String? =
@@ -193,16 +242,15 @@ object M3uParser {
         Regex("""$attr="([^"]*?)"""", RegexOption.IGNORE_CASE)
             .find(line)?.groupValues?.get(1)?.takeIf { it.isNotBlank() }
 
-    /** Matches working app's tt.B() */
-    private fun normalizeDrmScheme(value: String?): String = when {
-        value == null                                    -> ""
-        value.contains("widevine",  ignoreCase = true)  -> "widevine"
-        value.contains("playready", ignoreCase = true)  -> "playready"
-        value.contains("clearkey",  ignoreCase = true)  -> "clearkey"
-        else                                             -> ""
+    private fun normalizeDrm(value: String?): String = when {
+        value == null                                   -> ""
+        value.contains("widevine",  ignoreCase = true) -> "widevine"
+        value.contains("playready", ignoreCase = true) -> "playready"
+        value.contains("clearkey",  ignoreCase = true) -> "clearkey"
+        else                                            -> ""
     }
 
-    // ── Public utilities used by PlayerActivity ───────────────────────────────
+    // ── Public byte utilities (used by PlayerActivity) ────────────────────────
 
     fun hexToBytes(hex: String): ByteArray {
         val clean = hex.trim()
