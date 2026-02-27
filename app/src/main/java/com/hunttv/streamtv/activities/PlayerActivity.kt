@@ -29,12 +29,16 @@ import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.drm.DefaultDrmSessionManager
+import androidx.media3.exoplayer.drm.FrameworkMediaDrm
+import androidx.media3.exoplayer.drm.LocalMediaDrmCallback
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.ui.PlayerView
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.hunttv.streamtv.R
+import com.hunttv.streamtv.models.ParsedStreamData
 import com.hunttv.streamtv.utils.StreamParser
 import org.json.JSONObject
 
@@ -60,7 +64,7 @@ class PlayerActivity : AppCompatActivity() {
         )
     }
 
-    private var player:        ExoPlayer? = null
+    private var player: ExoPlayer? = null
     private lateinit var playerView:    PlayerView
     private lateinit var trackSelector: DefaultTrackSelector
 
@@ -73,8 +77,7 @@ class PlayerActivity : AppCompatActivity() {
     private var selectedAudioTrackGroup: androidx.media3.common.Tracks.Group? = null
     private var selectedAudioTrackIndex  = -1
 
-    // 0 = hardware, 1 = prefer-SW, 2 = force-SW
-    private var rendererFallback = 0
+    private var rendererFallback = 0   // 0=HW, 1=prefer-SW, 2=force-SW
     private var retryIndex       = 0
     private var currentStreamUrl = ""
     private var isPlaylistMode   = false
@@ -133,11 +136,11 @@ class PlayerActivity : AppCompatActivity() {
         try {
             val parsed  = StreamParser.parseStreamUrl(streamUrl)
             Log.d(TAG, "▶ url=${parsed.baseUrl}")
-            Log.d(TAG, "  scheme=${parsed.drmScheme} rendererFallback=$rendererFallback retryUA=$retryIndex")
+            Log.d(TAG, "  scheme=${parsed.drmScheme} license=${parsed.drmLicense?.take(60)}")
+            Log.d(TAG, "  rendererFallback=$rendererFallback retryUA=$retryIndex")
 
             val headers = buildRequestHeaders(parsed)
 
-            // ── DataSource ───────────────────────────────────────────────────
             val dataSourceFactory = DefaultHttpDataSource.Factory()
                 .setUserAgent(headers["User-Agent"] ?: "HuntTV/1.0")
                 .setDefaultRequestProperties(headers)
@@ -145,15 +148,12 @@ class PlayerActivity : AppCompatActivity() {
                 .setConnectTimeoutMs(30_000)
                 .setReadTimeoutMs(30_000)
 
-            // ── TrackSelector (params set AFTER playerView.player — see below) ─
             trackSelector = DefaultTrackSelector(this)
 
-            // ── LoadControl ──────────────────────────────────────────────────
             val loadControl = DefaultLoadControl.Builder()
                 .setBufferDurationsMs(8_000, 50_000, 1_500, 4_000)
                 .build()
 
-            // ── RenderersFactory — escalate to SW on decoder errors ──────────
             val renderersFactory = DefaultRenderersFactory(this).apply {
                 setExtensionRendererMode(
                     when (rendererFallback) {
@@ -165,42 +165,40 @@ class PlayerActivity : AppCompatActivity() {
                 setEnableDecoderFallback(true)
             }
 
-            // ── MediaItem (with DRM if needed) ───────────────────────────────
-            val mediaItem = buildMediaItem(parsed, headers)
+            val (mediaItem, drmSessionManager) = buildMediaConfig(parsed, headers)
 
-            // ── Build player ─────────────────────────────────────────────────
+            val mediaSourceFactory = DefaultMediaSourceFactory(dataSourceFactory).also { factory ->
+                if (drmSessionManager != null) {
+                    factory.setDrmSessionManagerProvider { drmSessionManager }
+                }
+            }
+
             player?.release(); player = null
 
             player = ExoPlayer.Builder(this)
                 .setTrackSelector(trackSelector)
                 .setLoadControl(loadControl)
-                .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
+                .setMediaSourceFactory(mediaSourceFactory)
                 .setRenderersFactory(renderersFactory)
                 .build()
 
-            // ── CRITICAL: attach to PlayerView BEFORE setting trackSelector params ──
-            // PlayerView.setPlayer() internally calls
-            //   trackSelector.setParameters(...setViewportSize(w, h)...)
-            // which would override our constraints if we set them first.
-            // By attaching first, then overriding, our params WIN.
+            // CRITICAL: attach to PlayerView FIRST, then set trackSelector params.
+            // PlayerView.setPlayer() calls trackSelector.setParameters(...setViewportSize...)
+            // which would constrain video tracks to screen size. We override it right after.
             playerView.player = player
 
-            // ── NOW set trackSelector params — overrides PlayerView's viewport ─
             trackSelector.setParameters(
                 trackSelector.buildUponParameters()
-                    // ↓ THE key fix for "black screen" — ignore device/viewport size limits
                     .clearVideoSizeConstraints()
                     .setAllowVideoMixedMimeTypeAdaptiveness(true)
                     .setAllowVideoNonSeamlessAdaptiveness(true)
                     .setAllowAudioMixedMimeTypeAdaptiveness(true)
                     .setSelectUndeterminedTextLanguage(true)
-                    // Play video even if device reports capability issues
                     .setExceedVideoConstraintsIfNecessary(true)
                     .setExceedRendererCapabilitiesIfNecessary(true)
                     .build()
             )
 
-            // ── Listener ─────────────────────────────────────────────────────
             player?.addListener(object : Player.Listener {
 
                 override fun onPlaybackStateChanged(state: Int) {
@@ -212,7 +210,7 @@ class PlayerActivity : AppCompatActivity() {
 
                 override fun onPlayerError(error: PlaybackException) {
                     val msg = error.cause?.message ?: error.message ?: "Unknown"
-                    Log.e(TAG, "✗ error=${error.errorCode} msg=$msg")
+                    Log.e(TAG, "✗ errorCode=${error.errorCode} msg=$msg")
                     when {
                         isRendererError(error) && rendererFallback < 2 -> {
                             rendererFallback++
@@ -247,15 +245,11 @@ class PlayerActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * After STATE_READY: if a video track exists but wasn't selected, force it.
-     * Secondary safety net alongside clearVideoSizeConstraints().
-     */
+    // If video track exists but wasn't auto-selected, force it
     private fun checkAndForceVideoTrack() {
         val p = player ?: return
         var hasVideo = false; var videoSelected = false
         var firstGroup: androidx.media3.common.Tracks.Group? = null; var firstIdx = 0
-
         for (g in p.currentTracks.groups) {
             if (g.type != C.TRACK_TYPE_VIDEO) continue
             hasVideo = true
@@ -265,7 +259,6 @@ class PlayerActivity : AppCompatActivity() {
             }
             if (g.isSelected) { videoSelected = true; break }
         }
-
         if (hasVideo && !videoSelected && firstGroup != null) {
             Log.w(TAG, "⚠ Video not selected — forcing override")
             trackSelector.setParameters(
@@ -288,95 +281,88 @@ class PlayerActivity : AppCompatActivity() {
     )
 
     // ─────────────────────────────────────────────────────────────────────────
-    // MediaItem / DRM
+    // MediaItem + DRM
+    //
+    // PATH A: No DRM        → plain MediaItem
+    // PATH B: HTTP license  → MediaItem with DrmConfiguration(uuid + licenseUri)
+    // PATH C: Inline ClearKey JSON or kid:key pairs
+    //         → MediaItem with DrmConfiguration(CLEARKEY_UUID, NO licenseUri)
+    //           + LocalMediaDrmCallback via MediaSourceFactory.setDrmSessionManagerProvider
+    //         NOTE: MediaItem MUST have DrmConfiguration so Media3 activates the DRM
+    //         session. Without it Media3 plays the encrypted stream raw → black screen.
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * Builds MediaItem with DRM baked in.
-     *
-     * For inline ClearKey JSON (from #KODIPROP license_key):
-     *   Encode JSON as a data: URI and set it as the license URI.
-     *   Media3's native ClearKey handler resolves data: URIs directly —
-     *   no network call, no LocalMediaDrmCallback needed.
-     *   This is the correct path; LocalMediaDrmCallback has known issues
-     *   with DASH init-segment decryption in Media3 1.x.
-     *
-     * For HTTP license URLs (Widevine / PlayReady / remote ClearKey):
-     *   Standard MediaItem.DrmConfiguration with the URL.
-     */
-    private fun buildMediaItem(
-        parsed:  com.hunttv.streamtv.models.ParsedStreamData,
+    private fun buildMediaConfig(
+        parsed:  ParsedStreamData,
         headers: Map<String, String>
-    ): MediaItem {
+    ): Pair<MediaItem, DefaultDrmSessionManager?> {
 
         val baseUri = Uri.parse(parsed.baseUrl)
         val scheme  = parsed.drmScheme
         val license = parsed.drmLicense
 
-        // No DRM
+        // PATH A
         if (scheme == null || license == null) {
-            Log.d(TAG, "No DRM — plain stream")
-            return MediaItem.Builder().setUri(baseUri).build()
+            Log.d(TAG, "PATH A: plain stream")
+            return Pair(MediaItem.Builder().setUri(baseUri).build(), null)
         }
 
         val drmUuid = when (scheme.lowercase()) {
             "clearkey"  -> C.CLEARKEY_UUID
             "widevine"  -> C.WIDEVINE_UUID
             "playready" -> C.PLAYREADY_UUID
-            else        -> {
-                Log.w(TAG, "Unknown DRM scheme: $scheme — playing without DRM")
-                return MediaItem.Builder().setUri(baseUri).build()
+            else -> {
+                Log.w(TAG, "Unknown DRM '$scheme' — playing without DRM")
+                return Pair(MediaItem.Builder().setUri(baseUri).build(), null)
             }
         }
 
-        // HTTP license URL
+        // PATH B
         if (URL_REGEX.matches(license)) {
-            Log.d(TAG, "DRM: HTTP license URL")
-            return MediaItem.Builder()
-                .setUri(baseUri)
-                .setDrmConfiguration(
-                    MediaItem.DrmConfiguration.Builder(drmUuid)
-                        .setLicenseUri(license)
-                        .setLicenseRequestHeaders(headers)
-                        .build()
-                ).build()
+            Log.d(TAG, "PATH B: HTTP license")
+            return Pair(
+                MediaItem.Builder()
+                    .setUri(baseUri)
+                    .setDrmConfiguration(
+                        MediaItem.DrmConfiguration.Builder(drmUuid)
+                            .setLicenseUri(license)
+                            .setLicenseRequestHeaders(headers)
+                            .build()
+                    ).build(),
+                null
+            )
         }
 
-        // Inline ClearKey JSON  e.g. {"keys":[{"kty":"oct","k":"...","kid":"..."}],"type":"temporary"}
-        // OR  kid:key pair  e.g. "abc123:def456"
-        val clearKeyJson = if (license.trimStart().startsWith("{")) {
-            // Already valid JSON
-            license
-        } else {
-            // Build JSON from kid:key pairs
-            buildClearKeyJson(license)
+        // PATH C
+        val clearKeyJson: String? = when {
+            license.trimStart().startsWith("{") -> license
+            else -> buildClearKeyJsonFromPairs(license)
         }
 
         if (clearKeyJson == null) {
-            Log.w(TAG, "Could not build ClearKey JSON — playing without DRM")
-            return MediaItem.Builder().setUri(baseUri).build()
+            Log.w(TAG, "PATH C: failed to build ClearKey JSON — playing without DRM")
+            return Pair(MediaItem.Builder().setUri(baseUri).build(), null)
         }
 
-        Log.d(TAG, "DRM: inline ClearKey via data: URI")
-        Log.d(TAG, "  JSON: ${clearKeyJson.take(120)}")
+        Log.d(TAG, "PATH C: inline ClearKey JSON=${clearKeyJson.take(120)}")
 
-        // Encode JSON as data: URI — Media3's ClearKey handler resolves this natively
-        val jsonB64 = Base64.encodeToString(
-            clearKeyJson.toByteArray(Charsets.UTF_8),
-            Base64.NO_WRAP
-        )
-        val licenseDataUri = "data:text/plain;base64,$jsonB64"
-
-        return MediaItem.Builder()
+        val mediaItem = MediaItem.Builder()
             .setUri(baseUri)
             .setDrmConfiguration(
                 MediaItem.DrmConfiguration.Builder(C.CLEARKEY_UUID)
-                    .setLicenseUri(licenseDataUri)
+                    // No setLicenseUri() — LocalMediaDrmCallback handles key delivery
                     .build()
             ).build()
+
+        val drmMgr = DefaultDrmSessionManager.Builder()
+            .setUuidAndExoMediaDrmProvider(C.CLEARKEY_UUID, FrameworkMediaDrm.DEFAULT_PROVIDER)
+            .setMultiSession(false)
+            .build(LocalMediaDrmCallback(clearKeyJson.toByteArray(Charsets.UTF_8)))
+
+        return Pair(mediaItem, drmMgr)
     }
 
-    private fun buildClearKeyJson(license: String): String? {
+    private fun buildClearKeyJsonFromPairs(license: String): String? {
         val sep = if (license.contains("|")) "|" else ","
         val entries = license.split(sep).mapNotNull { pair ->
             val idx = pair.indexOf(":"); if (idx < 0) return@mapNotNull null
@@ -385,7 +371,9 @@ class PlayerActivity : AppCompatActivity() {
             if (kid.isEmpty() || key.isEmpty()) return@mapNotNull null
             val (kidB64, keyB64) = try {
                 Pair(hexToBase64Url(kid), hexToBase64Url(key))
-            } catch (e: Exception) { Pair(kid, key) }
+            } catch (e: Exception) {
+                Pair(kid, key)
+            }
             """{"kty":"oct","k":"$keyB64","kid":"$kidB64"}"""
         }
         return if (entries.isEmpty()) null
@@ -393,7 +381,7 @@ class PlayerActivity : AppCompatActivity() {
     }
 
     private fun hexToBase64Url(hex: String): String {
-        require(hex.length % 2 == 0) { "Odd hex length" }
+        require(hex.length % 2 == 0) { "Odd hex length: ${hex.length}" }
         val bytes = ByteArray(hex.length / 2) { i ->
             hex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
         }
@@ -404,7 +392,7 @@ class PlayerActivity : AppCompatActivity() {
     // Headers
     // ─────────────────────────────────────────────────────────────────────────
 
-    private fun buildRequestHeaders(parsed: com.hunttv.streamtv.models.ParsedStreamData): MutableMap<String, String> {
+    private fun buildRequestHeaders(parsed: ParsedStreamData): MutableMap<String, String> {
         val h = mutableMapOf<String, String>()
         h.putAll(parsed.headers)
         parsed.extHttpJson?.let { json ->
@@ -413,8 +401,11 @@ class PlayerActivity : AppCompatActivity() {
                 while (keys.hasNext()) {
                     val k = keys.next(); val v = obj.getString(k)
                     val norm = when (k.lowercase()) {
-                        "cookie" -> "Cookie"; "user-agent" -> "User-Agent"
-                        "referer" -> "Referer"; "origin" -> "Origin"; else -> k
+                        "cookie"     -> "Cookie"
+                        "user-agent" -> "User-Agent"
+                        "referer"    -> "Referer"
+                        "origin"     -> "Origin"
+                        else         -> k
                     }
                     h.putIfAbsent(norm, v)
                 }
@@ -514,28 +505,47 @@ class PlayerActivity : AppCompatActivity() {
     private fun formatVideo(f: Format): String {
         val kbps = if (f.bitrate > 0) f.bitrate / 1000 else 0
         val fps  = if (f.frameRate > 0) f.frameRate.toInt() else 0
-        return when { fps > 0 && kbps > 0 -> "${f.height}p (${fps}fps, $kbps kbps)"; kbps > 0 -> "${f.height}p ($kbps kbps)"; f.height > 0 -> "${f.height}p"; else -> "Unknown" }
+        return when {
+            fps > 0 && kbps > 0 -> "${f.height}p (${fps}fps, $kbps kbps)"
+            kbps > 0            -> "${f.height}p ($kbps kbps)"
+            f.height > 0        -> "${f.height}p"
+            else                -> "Unknown"
+        }
     }
 
     private fun formatAudio(f: Format): String {
-        val lang = f.language ?: "und"; val kbps = if (f.bitrate > 0) f.bitrate / 1000 else 0
-        return when { kbps > 0 && f.channelCount > 0 -> "[$lang] $kbps kbps ${f.channelCount}ch"; kbps > 0 -> "[$lang] $kbps kbps"; else -> "[$lang]" }
+        val lang = f.language ?: "und"
+        val kbps = if (f.bitrate > 0) f.bitrate / 1000 else 0
+        return when {
+            kbps > 0 && f.channelCount > 0 -> "[$lang] $kbps kbps ${f.channelCount}ch"
+            kbps > 0                       -> "[$lang] $kbps kbps"
+            else                           -> "[$lang]"
+        }
     }
 
     data class TrackInfo(val type: String, val index: Int, val format: Format, val group: androidx.media3.common.Tracks.Group)
     data class QualityItem(val label: String, val trackInfo: TrackInfo? = null, val isAuto: Boolean = false, val isSelected: Boolean = false)
 
-    inner class QualityAdapter(private val items: List<QualityItem>, private val onClick: (QualityItem) -> Unit) :
-        RecyclerView.Adapter<QualityAdapter.VH>() {
+    inner class QualityAdapter(
+        private val items: List<QualityItem>,
+        private val onClick: (QualityItem) -> Unit
+    ) : RecyclerView.Adapter<QualityAdapter.VH>() {
         inner class VH(v: View) : RecyclerView.ViewHolder(v) {
             val label: TextView = v.findViewById(R.id.tv_quality_label)
             val check: TextView = v.findViewById(R.id.tv_checkmark)
         }
-        override fun onCreateViewHolder(p: ViewGroup, t: Int) = VH(LayoutInflater.from(p.context).inflate(R.layout.item_quality_track, p, false))
+        override fun onCreateViewHolder(p: ViewGroup, t: Int) =
+            VH(LayoutInflater.from(p.context).inflate(R.layout.item_quality_track, p, false))
         override fun onBindViewHolder(h: VH, pos: Int) {
-            val item = items[pos]; h.label.text = item.label
-            if (item.isSelected) { h.label.setTextColor(Color.parseColor("#00BCD4")); h.check.visibility = View.VISIBLE }
-            else { h.label.setTextColor(Color.WHITE); h.check.visibility = View.GONE }
+            val item = items[pos]
+            h.label.text = item.label
+            if (item.isSelected) {
+                h.label.setTextColor(Color.parseColor("#00BCD4"))
+                h.check.visibility = View.VISIBLE
+            } else {
+                h.label.setTextColor(Color.WHITE)
+                h.check.visibility = View.GONE
+            }
             h.itemView.setOnClickListener { onClick(item) }
         }
         override fun getItemCount() = items.size
