@@ -11,23 +11,23 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 /**
- * M3U parser that handles BOTH orderings of metadata tags:
+ * Handles BOTH tag orderings found in real playlists:
  *
- *   ORDER A (standard — tags AFTER #EXTINF):
- *     #EXTINF:-1 ...,Channel Name
- *     #KODIPROP:inputstream.adaptive.license_type=clearkey
- *     #KODIPROP:inputstream.adaptive.license_key={...}
- *     https://stream.url/manifest.mpd
+ * ORDER A — tags AFTER #EXTINF (standard):
+ *   #EXTINF:-1 ...,Name
+ *   #KODIPROP:inputstream.adaptive.license_type=clearkey
+ *   #KODIPROP:inputstream.adaptive.license_key={...}
+ *   https://stream.url
  *
- *   ORDER B (JioTV/ZEE5 style — tags BEFORE #EXTINF):
- *     #KODIPROP:inputstream.adaptive.license_type=clearkey
- *     #KODIPROP:inputstream.adaptive.license_key={...}
- *     #EXTINF:-1 tvg-id="Zoom" ...,ZOOM
- *     https://stream.url/manifest.mpd
+ * ORDER B — tags BEFORE #EXTINF (JioTV / ZEE5 / Watcho style):
+ *   #KODIPROP:inputstream.adaptive.license_type=clearkey
+ *   #KODIPROP:inputstream.adaptive.license_key={...}
+ *   #EXTINF:-1 ...,Name
+ *   https://stream.url
  *
- * The previous parser only handled Order A. Order B caused all
- * #KODIPROP / #EXTVLCOPT lines to be silently dropped, so DRM
- * streams played without keys → black video + audio.
+ * The old parser only handled Order A, so all #KODIPROP lines in
+ * Order B playlists were silently dropped → stream played encrypted
+ * → black video + audio only.
  */
 object M3uParser {
     private const val TAG = "M3uParser"
@@ -59,52 +59,43 @@ object M3uParser {
         while (i < lines.size) {
             val line = lines[i].trim()
 
-            // ── Skip blank lines and the #EXTM3U header ───────────────────────
             if (line.isEmpty() || line.startsWith("#EXTM3U")) { i++; continue }
-
-            // ── Find the #EXTINF line ─────────────────────────────────────────
             if (!line.startsWith("#EXTINF")) { i++; continue }
 
             val extinf = line
 
-            // ── Collect ALL contiguous metadata lines around this #EXTINF ─────
-            // Look BACKWARDS from the #EXTINF to pick up tags that came before it
-            // (Order B: #KODIPROP / #EXTVLCOPT before #EXTINF)
+            // ── Collect meta lines BEFORE this #EXTINF (Order B support) ─────
             val metaLines = mutableListOf<String>()
-
-            // Scan backwards: collect preceding comment lines until a blank,
-            // another #EXTINF, a URL, or the start of file
             var back = i - 1
             while (back >= 0) {
                 val prev = lines[back].trim()
                 when {
-                    prev.isEmpty()                -> break   // blank line = block separator
-                    prev.startsWith("#EXTINF")    -> break   // another channel block
-                    prev.startsWith("#EXTM3U")    -> break
-                    !prev.startsWith("#")         -> break   // URL line = previous channel's URL
-                    else                          -> metaLines.add(0, prev) // prepend (preserve order)
+                    prev.isEmpty()             -> break
+                    prev.startsWith("#EXTINF") -> break
+                    prev.startsWith("#EXTM3U") -> break
+                    !prev.startsWith("#")      -> break  // URL of previous channel
+                    else                       -> { metaLines.add(0, prev); back-- }
                 }
-                back--
             }
 
-            // Now scan FORWARD from i+1 to collect tags after #EXTINF
+            // ── Collect meta lines AFTER this #EXTINF (Order A support) ──────
             var j = i + 1
             while (j < lines.size) {
                 val next = lines[j].trim()
                 when {
                     next.isEmpty()             -> { j++; continue }
-                    next.startsWith("#EXTINF") -> break   // next channel
+                    next.startsWith("#EXTINF") -> break
                     next.startsWith("#")       -> { metaLines.add(next); j++ }
-                    else                       -> break   // stream URL
+                    else                       -> break  // stream URL
                 }
             }
 
-            // ── j now points at the stream URL line ───────────────────────────
+            // j now points at the stream URL line
             if (j >= lines.size) { i++; continue }
             val urlLine = lines[j].trim()
             if (urlLine.isEmpty() || urlLine.startsWith("#")) { i++; continue }
 
-            i = j + 1  // advance past the URL line
+            i = j + 1
 
             // ── Parse #EXTINF attributes ──────────────────────────────────────
             val name    = extinf.substringAfterLast(",").trim()
@@ -113,7 +104,7 @@ object M3uParser {
             val tvgId   = extractAttr(extinf, "tvg-id")
             val tvgName = extractAttr(extinf, "tvg-name")
 
-            // ── Parse all collected metadata lines ────────────────────────────
+            // ── Parse collected metadata ──────────────────────────────────────
             var userAgent   = ""
             var cookie      = ""
             var referer     = ""
@@ -141,31 +132,29 @@ object M3uParser {
                     }
 
                     meta.startsWith("#KODIPROP", ignoreCase = true) -> {
-                        // Matches both:
+                        // Handles both:
                         //   #KODIPROP:license_type=clearkey
                         //   #KODIPROP:inputstream.adaptive.license_type=clearkey
                         if (lower.contains("license_type"))
                             drmScheme  = normalizeDrm(regexFirst(meta, "(?i).*license_type=(.+)"))
                         if (lower.contains("license_key"))
-                        // Capture EVERYTHING after license_key= including JSON with : and =
                             drmLicense = regexFirst(meta, "(?i).*license_key=(.+)") ?: drmLicense
                     }
 
-                    meta.startsWith("#EXTHTTP", ignoreCase = true) -> {
+                    meta.startsWith("#EXTHTTP", ignoreCase = true) ->
                         extHttpJson = meta.substringAfter(":").trim()
-                    }
                 }
             }
 
-            // ── Parse URL line for pipe-suffix headers ────────────────────────
+            // ── Parse pipe-suffix params on the URL line ──────────────────────
             val (cleanUrl, pipeParams) = splitUrlAndPipe(urlLine)
             if (cleanUrl.isEmpty()) continue
 
             if (pipeParams.isNotEmpty()) {
                 if (userAgent.isEmpty())  userAgent  = pipeParam(pipeParams, "user-agent", "useragent") ?: userAgent
-                if (referer.isEmpty())    referer    = pipeParam(pipeParams, "referer", "referrer") ?: referer
-                if (origin.isEmpty())     origin     = pipeParam(pipeParams, "origin") ?: origin
-                if (cookie.isEmpty())     cookie     = pipeParam(pipeParams, "cookie") ?: cookie
+                if (referer.isEmpty())    referer    = pipeParam(pipeParams, "referer", "referrer")     ?: referer
+                if (origin.isEmpty())     origin     = pipeParam(pipeParams, "origin")                  ?: origin
+                if (cookie.isEmpty())     cookie     = pipeParam(pipeParams, "cookie")                  ?: cookie
                 if (drmScheme.isEmpty())  drmScheme  = normalizeDrm(pipeParam(pipeParams, "drmscheme", "drm-scheme", "drm_scheme"))
                 if (drmLicense.isEmpty()) drmLicense = pipeParam(pipeParams, "drmlicense", "drm-license", "drm_license", "license_key") ?: drmLicense
             }
@@ -201,7 +190,7 @@ object M3uParser {
         return channels
     }
 
-    // ── URL / pipe splitting ──────────────────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
     private fun splitUrlAndPipe(urlLine: String): Pair<String, Map<String, String>> {
         val pipeIdx = urlLine.indexOf("|")
@@ -211,9 +200,9 @@ object M3uParser {
         val suffix = urlLine.substring(pipeIdx + 1).trim()
         if (base.isEmpty()) return Pair("", emptyMap())
 
-        val params   = mutableMapOf<String, String>()
+        val params     = mutableMapOf<String, String>()
         val isAmpStyle = suffix.contains("&") || !suffix.contains("|")
-        val segments = if (isAmpStyle) suffix.split("&") else suffix.split("|")
+        val segments   = if (isAmpStyle) suffix.split("&") else suffix.split("|")
 
         segments.forEach { seg ->
             val eq = seg.indexOf("="); if (eq < 0) return@forEach
@@ -228,8 +217,6 @@ object M3uParser {
         for (k in keys) { val v = params[k]; if (!v.isNullOrEmpty()) return v }
         return null
     }
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
 
     private fun regexFirst(input: String, pattern: String): String? =
         Regex(pattern).find(input)?.groupValues?.get(1)?.trim()?.takeIf { it.isNotEmpty() }
